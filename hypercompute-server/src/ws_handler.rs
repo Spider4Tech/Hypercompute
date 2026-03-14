@@ -8,7 +8,7 @@ use axum::{
 use chrono::Utc;
 use futures::{sink::SinkExt, stream::StreamExt};
 use hypercompute_proto::{
-    NodeInfo, NodeStats, NodeStatus, TaskOutput, TaskStatus, WorkerMessage,
+    NodeInfo, NodeStats, NodeStatus, TaskStatus, WorkerMessage,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;

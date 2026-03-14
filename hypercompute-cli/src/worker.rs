@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::Args;
 use futures::{SinkExt, StreamExt};
 use hypercompute_proto::{NodeCapabilities, NodeStats, ServerMessage, WorkerMessage};
@@ -272,7 +272,7 @@ fn build_capabilities(args: &WorkerArgs, _name: &str) -> NodeCapabilities {
     }
 }
 
-fn collect_stats(caps: &NodeCapabilities, active_tasks: u32) -> NodeStats {
+fn collect_stats(_caps: &NodeCapabilities, active_tasks: u32) -> NodeStats {
     let mut sys = sysinfo::System::new_all();
     sys.refresh_cpu();
     sys.refresh_memory();

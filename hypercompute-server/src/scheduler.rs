@@ -26,7 +26,7 @@ async fn dispatch_pending(state: &Arc<AppState>) {
         let best = score_nodes_for_task(state, &task.requirements);
 
         if let Some((node_id, score)) = best {
-            let msg = ServerMessage::DispatchTask { task: task.clone() };
+            let msg = ServerMessage::DispatchTask { task: Box::new(task.clone()) };
             let json = match serde_json::to_string(&msg) {
                 Ok(j) => j,
                 Err(e) => {

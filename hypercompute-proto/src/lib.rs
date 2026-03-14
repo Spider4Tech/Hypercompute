@@ -1,4 +1,4 @@
-/// hypercompute-proto: shared protocol types between server and CLI workers.
+//! hypercompute-proto: shared protocol types between server and CLI workers.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -158,7 +158,7 @@ impl NodeInfo {
         };
         let latency_score = match self.stats.latency_ms {
             None => 0.5,
-            Some(ms) => (1.0 - (ms as f64 / 500.0).min(1.0)),
+            Some(ms) => 1.0 - (ms as f64 / 500.0).min(1.0),
         };
         let region_bonus = match &req.preferred_region {
             Some(r) if r == &self.capabilities.region => 0.1,
@@ -218,7 +218,7 @@ pub enum ServerMessage {
     /// Acknowledge registration.
     Registered { node_id: Uuid },
     /// Dispatch a task to this worker.
-    DispatchTask { task: Task },
+    DispatchTask { task: Box<Task> },
     /// Cancel a previously dispatched task.
     CancelTask { task_id: Uuid },
     /// Server is shutting down.
