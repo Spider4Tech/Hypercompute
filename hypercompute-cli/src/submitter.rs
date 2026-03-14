@@ -129,7 +129,11 @@ pub async fn status(server: String, task_id: String, wait: bool) -> Result<()> {
 async fn poll_until_done(server: &str, id: Uuid) -> Result<()> {
     let client = reqwest::Client::new();
     println!("Waiting for task {}...", id);
+
     loop {
+        // Small delay before each poll — gives the worker time to execute and report back.
+        tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
         let resp: TaskStatusResponse = client
             .get(format!("{}/api/v1/tasks/{}", server, id))
             .send().await?
@@ -138,7 +142,7 @@ async fn poll_until_done(server: &str, id: Uuid) -> Result<()> {
 
         match &resp.task.status {
             TaskStatus::Completed { duration_ms, node_id } => {
-                println!("\n✓ Completed in {}ms (node: {})", duration_ms, node_id);
+                println!("✓ Completed in {}ms (node: {})", duration_ms, node_id);
                 if let Some(output) = &resp.result {
                     if !output.stdout.is_empty() {
                         println!("--- stdout ---\n{}", output.stdout.trim());
@@ -159,8 +163,7 @@ async fn poll_until_done(server: &str, id: Uuid) -> Result<()> {
                 return Err(anyhow!("Task timed out"));
             }
             status => {
-                print!("\r  {:?}...  ", status);
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                println!("  status: {:?}", status);
             }
         }
     }
