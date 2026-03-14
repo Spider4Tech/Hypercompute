@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "hypercompute-proto",
+    "hypercompute-server",
+    "hypercompute-cli",
+]
+resolver = "2"
+
