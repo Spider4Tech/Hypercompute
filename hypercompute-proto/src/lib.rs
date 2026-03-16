@@ -1,11 +1,11 @@
-//! hypercompute-proto: shared protocol types between server and CLI workers.
+/// hypercompute-proto: shared protocol types between server and CLI workers.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-// ── Task ────────────────────────────────────────────────────────────────────
+// ── Task ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +16,54 @@ pub enum TaskKind {
     HttpFetch { url: String, method: String, body: Option<String> },
     /// Custom opaque payload; worker must know how to handle it by `tag`.
     Custom { tag: String, payload: Vec<u8> },
+    /// MPI parallel job distributed across `np` nodes simultaneously.
+    ///
+    /// The server selects `np` eligible nodes, assigns each a rank, then
+    /// sends an `MpiSlot` alongside this task to every recruited node.
+    /// Each worker launches the program with its rank injected via env vars:
+    ///   HC_MPI_RANK, HC_MPI_SIZE, HC_MPI_JOB_ID, HC_MPI_PEERS (JSON array).
+    ///
+    /// When `use_mpirun = true`, rank-0 invokes `mpirun --host <peers> …`
+    /// and the result is collected from rank-0 only.
+    /// When `use_mpirun = false` (pure-Rust / custom mode), each worker runs
+    /// independently and reports back; the server aggregates all outputs.
+    Mpi {
+        /// Executable to run on every rank (must exist on each worker node).
+        program: String,
+        /// Arguments forwarded to the program unchanged.
+        args: Vec<String>,
+        /// Total number of MPI processes (= nodes recruited).
+        np: u32,
+        /// Extra environment variables injected on every rank.
+        env: HashMap<String, String>,
+        /// Wall-clock timeout in seconds for the whole job.
+        timeout_secs: u64,
+        /// Use system mpirun/mpiexec (requires OpenMPI or MPICH on workers).
+        use_mpirun: bool,
+    },
+}
+
+/// One node's assignment inside an MPI job.
+/// Sent together with the `Task` in `ServerMessage::DispatchMpiSlot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpiSlot {
+    /// This node's rank (0 = root / result collector).
+    pub rank: u32,
+    /// Total number of ranks in the job.
+    pub size: u32,
+    /// Ordered peer list: index == rank. Each entry carries host+port+node_id.
+    pub peers: Vec<MpiPeer>,
+    /// Shared job UUID — identical for every slot of the same MPI job.
+    pub job_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpiPeer {
+    /// Hostname or IP reachable from other nodes.
+    pub host: String,
+    /// TCP port that this peer's MPI bootstrap listener is bound to.
+    pub port: u16,
+    pub node_id: Uuid,
 }
 
 /// Capabilities that a task may require from the executing node.
@@ -31,6 +79,8 @@ pub struct TaskRequirements {
     pub required_tags: Vec<String>,
     /// Preferred region, if any (soft constraint).
     pub preferred_region: Option<String>,
+    /// For MPI tasks: minimum number of slots (logical CPUs) per node.
+    pub mpi_slots_per_node: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,8 +88,13 @@ pub struct TaskRequirements {
 pub enum TaskStatus {
     Queued,
     Dispatched { node_id: Uuid },
+    /// MPI jobs are dispatched to multiple nodes simultaneously.
+    MpiDispatched { job_id: Uuid, node_ids: Vec<Uuid> },
     Running { node_id: Uuid, started_at: DateTime<Utc> },
+    MpiRunning { job_id: Uuid, started_at: DateTime<Utc>, total_ranks: u32 },
     Completed { node_id: Uuid, duration_ms: u64 },
+    /// MPI job completed: rank-0 stdout + per-rank exit codes.
+    MpiCompleted { job_id: Uuid, duration_ms: u64, ranks_ok: u32, ranks_failed: u32 },
     Failed { reason: String },
     TimedOut,
 }
@@ -48,11 +103,10 @@ pub enum TaskStatus {
 pub struct Task {
     pub id: Uuid,
     pub submitted_at: DateTime<Utc>,
-    pub priority: u8, // 0 = lowest, 255 = highest
+    pub priority: u8,
     pub kind: TaskKind,
     pub requirements: TaskRequirements,
     pub status: TaskStatus,
-    /// Arbitrary metadata from the submitter.
     pub meta: HashMap<String, String>,
 }
 
@@ -68,35 +122,33 @@ impl Task {
             meta: HashMap::new(),
         }
     }
+
+    pub fn is_mpi(&self) -> bool {
+        matches!(self.kind, TaskKind::Mpi { .. })
+    }
 }
 
-// ── Node ────────────────────────────────────────────────────────────────────
+// ── Node ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapabilities {
-    /// Total logical CPUs.
     pub cpu_cores: u32,
-    /// Total RAM in MB.
     pub total_ram_mb: u64,
-    /// Whether a GPU is present.
     pub has_gpu: bool,
-    /// Declared feature tags (e.g. ["python3", "ffmpeg", "docker"]).
     pub tags: Vec<String>,
-    /// Geographic region label (e.g. "eu-west", "us-east").
     pub region: String,
-    /// OS identifier (e.g. "linux-x86_64").
     pub os: String,
+    /// Host/IP reachable from other cluster nodes (for MPI peer connections).
+    pub mpi_host: String,
+    /// Whether mpirun/mpiexec is available on this node.
+    pub has_mpirun: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStats {
-    /// CPU usage percentage (0-100).
     pub cpu_used_pct: f32,
-    /// Free RAM in MB.
     pub ram_free_mb: u64,
-    /// Current number of tasks being executed.
     pub active_tasks: u32,
-    /// Round-trip latency to server in milliseconds (filled by server).
     pub latency_ms: Option<u64>,
     pub reported_at: DateTime<Utc>,
 }
@@ -106,7 +158,7 @@ pub struct NodeStats {
 pub enum NodeStatus {
     Online,
     Busy,
-    Draining, // graceful shutdown in progress
+    Draining,
     Offline,
 }
 
@@ -121,111 +173,73 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    /// Compute a score for this node against a task's requirements.
-    /// Higher is better. Returns None if node cannot satisfy hard requirements.
+    /// Score this node for a task. Returns None if hard requirements unmet.
     pub fn score_for(&self, req: &TaskRequirements) -> Option<f64> {
-        // Hard constraints
         if self.status == NodeStatus::Offline || self.status == NodeStatus::Draining {
             return None;
         }
         let cpu_free_pct = 100.0 - self.stats.cpu_used_pct;
-        if cpu_free_pct < req.min_cpu_free_pct {
-            return None;
-        }
-        if self.stats.ram_free_mb < req.min_ram_free_mb {
-            return None;
-        }
-        if req.requires_gpu && !self.capabilities.has_gpu {
-            return None;
-        }
+        if cpu_free_pct < req.min_cpu_free_pct { return None; }
+        if self.stats.ram_free_mb < req.min_ram_free_mb { return None; }
+        if req.requires_gpu && !self.capabilities.has_gpu { return None; }
         let tags_ok = req.required_tags.iter().all(|t| self.capabilities.tags.contains(t));
-        if !tags_ok {
-            return None;
-        }
+        if !tags_ok { return None; }
 
-        // Weighted scoring (all components in [0, 1])
-        let cpu_score = (cpu_free_pct / 100.0) as f64;
-        let ram_max = self.capabilities.total_ram_mb as f64;
-        let ram_score = if ram_max > 0.0 {
-            (self.stats.ram_free_mb as f64 / ram_max).min(1.0)
-        } else {
-            0.0
-        };
-        let load_score = if self.stats.active_tasks == 0 {
-            1.0
-        } else {
-            1.0 / (1.0 + self.stats.active_tasks as f64)
-        };
-        let latency_score = match self.stats.latency_ms {
-            None => 0.5,
-            Some(ms) => 1.0 - (ms as f64 / 500.0).min(1.0),
-        };
-        let region_bonus = match &req.preferred_region {
-            Some(r) if r == &self.capabilities.region => 0.1,
-            _ => 0.0,
-        };
+        let cpu_score   = (cpu_free_pct / 100.0) as f64;
+        let ram_max     = self.capabilities.total_ram_mb as f64;
+        let ram_score   = if ram_max > 0.0 { (self.stats.ram_free_mb as f64 / ram_max).min(1.0) } else { 0.0 };
+        let load_score  = if self.stats.active_tasks == 0 { 1.0 } else { 1.0 / (1.0 + self.stats.active_tasks as f64) };
+        let lat_score   = match self.stats.latency_ms { None => 0.5, Some(ms) => 1.0 - (ms as f64 / 500.0).min(1.0) };
+        let region_bonus = match &req.preferred_region { Some(r) if r == &self.capabilities.region => 0.1, _ => 0.0 };
 
-        let score = cpu_score * 0.35
-            + ram_score * 0.25
-            + load_score * 0.25
-            + latency_score * 0.10
-            + region_bonus * 0.05;
-
-        Some(score)
+        Some(cpu_score * 0.35 + ram_score * 0.25 + load_score * 0.25 + lat_score * 0.10 + region_bonus * 0.05)
     }
 }
 
-// ── WebSocket messages ───────────────────────────────────────────────────────
+// ── WebSocket messages ────────────────────────────────────────────────────────
 
-/// Messages sent FROM the worker CLI to the server.
+/// Messages FROM worker → server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
-    /// Initial registration on connect.
-    Register {
-        node_id: Uuid,
-        name: String,
-        capabilities: NodeCapabilities,
-    },
-    /// Periodic heartbeat with current stats.
-    Heartbeat {
-        node_id: Uuid,
-        stats: NodeStats,
-    },
-    /// Task completed successfully.
-    TaskResult {
+    Register    { node_id: Uuid, name: String, capabilities: NodeCapabilities },
+    Heartbeat   { node_id: Uuid, stats: NodeStats },
+    TaskResult  { task_id: Uuid, node_id: Uuid, duration_ms: u64, output: TaskOutput },
+    TaskError   { task_id: Uuid, node_id: Uuid, reason: String },
+    /// Report from one MPI rank once it finishes.
+    MpiRankResult {
+        job_id: Uuid,
         task_id: Uuid,
         node_id: Uuid,
+        rank: u32,
         duration_ms: u64,
         output: TaskOutput,
     },
-    /// Task failed.
-    TaskError {
+    MpiRankError {
+        job_id: Uuid,
         task_id: Uuid,
         node_id: Uuid,
+        rank: u32,
         reason: String,
     },
-    /// Worker is about to shut down gracefully.
-    Draining {
-        node_id: Uuid,
-    },
+    Draining    { node_id: Uuid },
 }
 
-/// Messages sent FROM the server to the worker CLI.
+/// Messages FROM server → worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Acknowledge registration.
-    Registered { node_id: Uuid },
-    /// Dispatch a task to this worker.
-    DispatchTask { task: Box<Task> },
-    /// Cancel a previously dispatched task.
-    CancelTask { task_id: Uuid },
-    /// Server is shutting down.
+    Registered    { node_id: Uuid },
+    DispatchTask  { task: Task },
+    /// Dispatch an MPI slot: same task + this node's rank assignment.
+    DispatchMpiSlot { task: Task, slot: MpiSlot },
+    CancelTask    { task_id: Uuid },
+    /// Abort an MPI job on this node (another rank failed).
+    AbortMpiJob   { job_id: Uuid, reason: String },
     ServerShutdown,
 }
 
-// ── REST API types ────────────────────────────────────────────────────────────
+// ── REST API types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitTaskRequest {
@@ -237,7 +251,6 @@ pub struct SubmitTaskRequest {
     #[serde(default)]
     pub meta: HashMap<String, String>,
 }
-
 fn default_priority() -> u8 { 128 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +263,15 @@ pub struct SubmitTaskResponse {
 pub struct TaskStatusResponse {
     pub task: Task,
     pub result: Option<TaskOutput>,
+    /// For MPI jobs: per-rank outputs.
+    pub mpi_results: Option<Vec<MpiRankOutput>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpiRankOutput {
+    pub rank: u32,
+    pub node_id: Uuid,
+    pub output: TaskOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,34 +292,18 @@ pub struct ServerStatusResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskOutput {
-    /// Exit code for shell tasks, HTTP status for fetches, etc.
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
-    /// For HTTP tasks, the response body.
     pub body: Option<Vec<u8>>,
-    /// For custom tasks, an opaque result payload.
     pub custom_result: Option<Vec<u8>>,
 }
 
 impl TaskOutput {
     pub fn success(stdout: impl Into<String>) -> Self {
-        Self {
-            exit_code: 0,
-            stdout: stdout.into(),
-            stderr: String::new(),
-            body: None,
-            custom_result: None,
-        }
+        Self { exit_code: 0, stdout: stdout.into(), stderr: String::new(), body: None, custom_result: None }
     }
-
     pub fn failure(exit_code: i32, stderr: impl Into<String>) -> Self {
-        Self {
-            exit_code,
-            stdout: String::new(),
-            stderr: stderr.into(),
-            body: None,
-            custom_result: None,
-        }
+        Self { exit_code, stdout: String::new(), stderr: stderr.into(), body: None, custom_result: None }
     }
 }

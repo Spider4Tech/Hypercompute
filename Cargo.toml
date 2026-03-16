@@ -5,4 +5,3 @@ members = [
     "hypercompute-cli",
 ]
 resolver = "2"
-
